@@ -1,0 +1,6 @@
+# Ignore the directory containing copied chat logs
+/chat_data/
+
+# Ignore the directory with renamed files
+txts/
+*.npy

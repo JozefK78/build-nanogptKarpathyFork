@@ -54,6 +54,30 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+
+class LoRALayer(nn.Module):
+
+    def __init__(self, linear_layer, rank, alpha):
+        super().__init__()
+        self.linear = linear_layer
+        self.rank = rank
+        self.alpha = alpha
+
+        # The original linear layer is frozen.
+        self.linear.weight.requires_grad = False
+        if self.linear.bias is not None:
+            self.linear.bias.requires_grad = False
+
+        # Create and initialize LoRA matrices
+        self.lora_A = nn.Parameter(torch.zeros(self.linear.in_features, rank))
+        self.lora_B = nn.Parameter(torch.zeros(rank, self.linear.out_features))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    def forward(self, x):
+        lora_output = (x @ self.lora_A @ self.lora_B) * (self.alpha / self.rank)
+        return self.linear(x) + lora_output
+
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -175,6 +199,34 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+
+    def apply_lora(self, rank, alpha):
+        """Applies LoRA to the model."""
+        # Freeze all existing parameters first.
+        for param in self.parameters():
+            param.requires_grad = False
+
+        # Apply LoRA to the attention layers in each block.
+        for block in self.transformer.h:
+            block.attn.c_attn = LoRALayer(block.attn.c_attn, rank, alpha)
+            block.attn.c_proj = LoRALayer(block.attn.c_proj, rank, alpha)
+
+    def merge_lora(self):
+        """Merges the LoRA weights back into the original model."""
+        for block in self.transformer.h:
+            # Merge c_attn
+            if isinstance(block.attn.c_attn, LoRALayer):
+                lora_layer = block.attn.c_attn
+                merged_weight = lora_layer.linear.weight + (lora_layer.lora_A @ lora_layer.lora_B).T * (lora_layer.alpha / lora_layer.rank)
+                lora_layer.linear.weight.data.copy_(merged_weight)
+                block.attn.c_attn = lora_layer.linear
+
+            # Merge c_proj
+            if isinstance(block.attn.c_proj, LoRALayer):
+                lora_layer = block.attn.c_proj
+                merged_weight = lora_layer.linear.weight + (lora_layer.lora_A @ lora_layer.lora_B).T * (lora_layer.alpha / lora_layer.rank)
+                lora_layer.linear.weight.data.copy_(merged_weight)
+                block.attn.c_proj = lora_layer.linear
 
     def configure_optimizers(self, weight_decay, learning_rate, device_type):
         # start with all of the candidate parameters (that require grad)
@@ -337,7 +389,8 @@ torch.set_float32_matmul_precision('high')
 
 # create model
 model = GPT(GPTConfig(vocab_size=50304))
-# model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
+# model = GPT.from_pretrained("gpt2") # init from OpenAI GPT-2
+# model.apply_lora(rank=4, alpha=1.0) # Apply LoRA for fine-tuning
 model.to(device)
 use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
@@ -516,6 +569,20 @@ for step in range(max_steps):
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum.item():.6f}\n")
+
+if master_process:
+    # merge LoRA weights back into the original model
+    if 'apply_lora' in locals() or 'apply_lora' in globals():
+        print("merging LoRA weights...")
+        model.merge_lora()
+    # save the final model
+    checkpoint_path = os.path.join(log_dir, f"model_final.pt")
+    checkpoint = {
+        'model': raw_model.state_dict(),
+        'config': raw_model.config,
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(f"final model saved to {checkpoint_path}")
 
 if ddp:
     destroy_process_group()
